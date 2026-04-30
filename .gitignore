@@ -1,0 +1,12 @@
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Jupyter generated files
+.ipynb_checkpoints/
+
+# Local conversation logs and PPT/debug notes
+conversation_history_*.md
+_conversation_history_*.md
+docs/_*.md
+*.log
