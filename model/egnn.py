@@ -1,4 +1,12 @@
-"""EGNN model"""
+"""EGNN model used as the equivariant backbone.
+
+The model consumes scalar node features ``h`` and coordinates ``pos``. It keeps
+scalar features rotation-invariant and updates coordinates equivariantly by
+aggregating edge-direction vectors multiplied by learned scalar weights.
+
+For periodic systems, distances and edge vectors are recovered from
+``cell/pbc/cell_offsets`` instead of simple ``pos_i - pos_j``.
+"""
 from typing import Optional, Tuple, List
 
 import torch
@@ -69,6 +77,8 @@ class EGNN(nn.Module):
         self.aggregation_method = aggregation_method
         self.reflect_equiv = reflect_equiv
 
+        # ``in_edge_nf`` counts explicit edge attributes supplied by the caller.
+        # Distance contributes an additional ``dist_dim`` channel below.
         edge_feat_nf = in_edge_nf
         if sin_embedding:
             self.sin_embedding = SinusoidsEmbeddingNew()
@@ -82,6 +92,9 @@ class EGNN(nn.Module):
         self.embedding = nn.Linear(in_node_nf, self.hidden_nf)
         self.embedding_out = nn.Linear(self.hidden_nf, out_node_nf)
 
+        # Initial edge input is [distance, optional_edge_features]. With the
+        # default debug config in_edge_nf=0 and sin_embedding=False, this is
+        # Linear(1, hidden_nf - 1).
         self.edge_embedding = nn.Linear(
             self.edge_feat_nf, self.hidden_nf - self.dist_dim
         )
@@ -150,8 +163,9 @@ class EGNN(nn.Module):
         Returns:
             Tuple[Tensor, Tensor, Tensor]: updated h, pos, edge_attr
         """
-        # Edit Emiel: Remove velocity as input
-        # Use PBC-aware distance calculation if cell and pbc are provided
+        # Build the initial distance feature for every edge. In periodic mode,
+        # this must use ASE cell_offsets so the model sees the same periodic
+        # images that were used to build edge_index.
         if cell is not None and pbc is not None:
             cell_offsets = cell_offsets if cell_offsets is not None else edge_shift
             out = get_pbc_distances(
@@ -166,7 +180,9 @@ class EGNN(nn.Module):
                 return_distance_vec=True,
                 normalize=True,
             )
-            distances = out["distances"].unsqueeze(1)  # Keep consistent with coord2diff output format
+            # Distance is one scalar per edge; unsqueeze makes it [E, 1] so it
+            # can be concatenated and passed through Linear/MLP layers.
+            distances = out["distances"].unsqueeze(1)  # [E, 1]
         else:
             distances, _ = coord2diff(pos, edge_index)
         
@@ -185,6 +201,8 @@ class EGNN(nn.Module):
         # edge_attr = symmetrize_edge(edge_attr, edge_index_ji)
 
         for i in range(0, self.n_layers):
+            # Each EquivariantBlock performs several scalar message-passing GCLs
+            # followed by one coordinate update.
             h, pos, edge_attr = self._modules["e_block_%d" % i](
                 h,
                 pos,
@@ -205,7 +223,8 @@ class EGNN(nn.Module):
 
             # edge_attr = symmetrize_edge(edge_attr, edge_index_ji)
 
-        # Important, the bias of the last linear might be non-zero
+        # Map hidden features back to the requested output feature dimension.
+        # Bias can make masked nodes non-zero, so masks are applied afterward.
         h = self.embedding_out(h)
         edge_attr = self.edge_embedding_out(edge_attr)
 

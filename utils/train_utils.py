@@ -1,3 +1,4 @@
+"""Training utilities shared by Lightning modules."""
 from __future__ import annotations
 
 from collections import deque
@@ -8,6 +9,8 @@ import torch
 
 
 class Queue:
+    """Fixed-length numeric queue used to track recent gradient norms."""
+
     def __init__(self, max_len: int = 100) -> None:
         self.max_len = max_len
         self.data: deque[float] = deque(maxlen=max_len)
@@ -27,6 +30,7 @@ class Queue:
 
 
 def get_grad_norm(parameters: Iterable[torch.nn.Parameter]) -> torch.Tensor:
+    """Compute global L2 norm over all available parameter gradients."""
     grads = [
         param.grad.detach().norm(2)
         for param in parameters

@@ -1,4 +1,16 @@
-"""Base layers for model."""
+"""Message-passing blocks used by EGNN and related models.
+
+The main classes are:
+
+``GCL``: scalar graph convolution layer. It computes edge messages and scatters
+them back to nodes.
+
+``EquivariantUpdate``: coordinate update layer. It multiplies edge direction
+vectors by learned scalar weights, then scatters vector updates to nodes.
+
+``EquivariantBlock``: combines several scalar GCL layers with one coordinate
+update.
+"""
 from typing import Tuple, Optional, List
 
 from torch import nn, Tensor
@@ -78,6 +90,8 @@ class GCL(nn.Module):
         Returns:
             Tuple[Tensor, Tensor]: e_ij_prime, m_ij
         """
+        # Build one message per edge. source/target are h_i and h_j with shape
+        # [E, node_nf]; edge_attr is usually [E, hidden_nf].
         if edge_attr is None:  # Unused.
             out = torch.cat([source, target], dim=1)
         else:
@@ -111,6 +125,8 @@ class GCL(nn.Module):
             Tuple[Tensor, Tensor]: h_i_prime, aggregationed node features
         """
         ii, jj = edge_index
+        # Aggregate all outgoing edge messages for each center/source node i.
+        # The result has shape [N, hidden_nf].
         agg = unsorted_segment_sum(
             edge_attr,
             ii,
@@ -121,6 +137,7 @@ class GCL(nn.Module):
         agg = torch.cat([h, agg], dim=1)
         if node_attr is not None:
             agg = torch.cat([agg, node_attr], dim=1)
+        # Residual node update: h_i' = h_i + phi_h(h_i, sum_j m_ij).
         out = h + self.node_mlp(agg)
         if node_mask is not None:
             out = out * node_mask
@@ -230,6 +247,8 @@ class EquivariantUpdate(nn.Module):
         subgraph_mask: Optional[Tensor] = None,
     ):
         ii, jj = edge_index
+        # Distances are invariant scalars. Aggregating them into h lets node
+        # features depend on local geometry without breaking rotational symmetry.
         if subgraph_mask is not None:
             distances = distances * subgraph_mask
         agg = unsorted_segment_sum(
@@ -276,6 +295,8 @@ class EquivariantUpdate(nn.Module):
             Tensor: updated positions.
         """
         ii, jj = edge_index
+        # coord_mlp returns one scalar per edge. Multiplying by coord_diff gives
+        # an equivariant vector update for that edge.
         input_tensor = torch.cat([h[ii], h[jj], edge_attr], dim=1)
         if self.tanh:
             trans = (
@@ -298,6 +319,7 @@ class EquivariantUpdate(nn.Module):
 
         if edge_mask is not None:
             trans = trans * edge_mask
+        # Sum all vector updates that belong to the same center/source node.
         agg = unsorted_segment_sum(
             trans,
             ii,
@@ -447,7 +469,9 @@ class EquivariantBlock(nn.Module):
             h_i, e_ij = GCL(h_i, ij, e_ij, ...)
         pos_i = EquivUpdate(h_i, pos_i, ij, pos_i - pos_j, e_ij, ...)
         """
-        # Use PBC-aware distance calculation if cell and pbc are provided
+        # Recompute distances/vectors inside each block because coordinates have
+        # changed after previous blocks. For periodic systems, keep using the
+        # fixed ASE cell_offsets so edge topology/images remain consistent.
         dist_dim = 1
         if cell is not None and pbc is not None:
             cell_offsets = cell_offsets if cell_offsets is not None else edge_shift
@@ -463,7 +487,7 @@ class EquivariantBlock(nn.Module):
                 return_distance_vec=True,
             )
             edge_vectors = out["distance_vec"]
-            distances = out["distances"].unsqueeze(1)  # Keep consistent with coord2diff output format
+            distances = out["distances"].unsqueeze(1)  # [E, 1]
             target_pos = get_edge_target_positions(
                 pos,
                 edge_index,
@@ -491,9 +515,12 @@ class EquivariantBlock(nn.Module):
         if self.sin_embedding is not None:
             distances = self.sin_embedding(distances)
             dist_dim = self.sin_embedding.dim
+        # Add the current distance scalar back to the hidden edge features. With
+        # hidden_nf=64 and distance dim=1, this often makes edge_attr [E, 64].
         edge_attr = torch.cat([distances, edge_attr], dim=1)
 
         for i in range(0, self.n_layers):
+            # Scalar message passing updates h and edge_attr, but not positions.
             h, edge_attr = self._modules["gcl_%d" % i](
                 h=h,
                 edge_index=edge_index,
@@ -502,6 +529,7 @@ class EquivariantBlock(nn.Module):
                 edge_mask=edge_mask,
             )
 
+        # Final step in the block updates coordinates equivariantly.
         pos, h = self._modules["gcl_equiv"](
             h,
             pos,

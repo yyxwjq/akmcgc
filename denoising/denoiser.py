@@ -1,3 +1,4 @@
+"""Noise-prediction wrapper used by the diffusion model."""
 from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
@@ -71,15 +72,35 @@ class Denoiser(BaseDenoiser):
         edge_attr: Optional[Tensor] = None,
         return_hidden: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor]] | Tuple[Tensor, Optional[Tensor], Tensor]:
+        """Predict the diffusion noise ``eps_h`` for one noisy joint graph.
+
+        Args:
+            h: ``[N, node_nf]`` noisy state, ordered as ``[pos, features]``.
+            edge_index: ``[2, E]`` graph edges.
+            t: ``[B, 1]`` normalized diffusion time. ``mask`` broadcasts it.
+            mask: ``[N]`` batch id per node.
+            fragment: ``[N]`` reactant/product id per node.
+            cell/pbc/cell_offsets: PBC geometry needed by the inner model.
+
+        Returns:
+            ``eps_h`` with the same shape as ``h``. The first ``pos_dim`` columns
+            are coordinate noise and the remaining columns are feature noise.
+        """
+        # Split noisy state into coordinates and scalar features. Coordinates are
+        # updated equivariantly by EGNN/LEFTNet; scalar features go through MLPs.
         pos = h[:, : self.pos_dim].clone()
         hidden = self.encode_node_features(h)
 
         if self.edge_encoder is not None and edge_attr is not None:
             edge_attr = self.edge_encoder(edge_attr)
 
+        # Append diffusion time and optional global conditions to every node.
         hidden, condition_dim = self.augment_with_conditions(hidden, t, mask, conditions)
 
         update_coords_mask = None if self.update_pocket_coords else None
+        # The inner equivariant model returns updated hidden features and
+        # coordinates. All PBC recovery happens inside the model using
+        # cell/pbc/cell_offsets plus mask/fragment.
         model_out = self.model(
             hidden,
             pos,
@@ -106,9 +127,12 @@ class Denoiser(BaseDenoiser):
             pos_out = pos
             edge_attr_out = None
 
+        # Remove appended condition columns before decoding feature noise.
         if condition_dim > 0 and hidden_out.size(1) >= condition_dim:
             hidden_out = hidden_out[:, :-condition_dim]
 
+        # Coordinate noise is represented as a velocity/update. It is centered
+        # per reaction sample to remove arbitrary global translation.
         vel = pos_out - pos
         if torch.any(torch.isnan(vel)):
             vel = torch.randn_like(vel)

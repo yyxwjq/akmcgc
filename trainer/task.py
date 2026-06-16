@@ -1,3 +1,12 @@
+"""PyTorch Lightning training modules for diffusion and confidence tasks.
+
+This file connects the lower-level pieces:
+
+``ReactionPairDataset -> Denoiser/ConfidencePredictor -> Diffusion -> Lightning Trainer``.
+
+Read ``DiffModule`` for denoising diffusion training, and ``ConfModule`` for a
+graph-level confidence prediction task.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,14 +23,14 @@ from torchmetrics import MeanAbsoluteError, PearsonCorrCoef, SpearmanCorrCoef
 from torchmetrics.classification import BinaryAUROC, BinaryAccuracy, BinaryF1Score, BinaryPrecision
 
 try:
-    from ..dataset import RxnDataset
+    from ..dataset import ReactionPairDataset
     from ..denoising import ConfidencePredictor, Denoiser
     from ..diffusion import DiffSchedule, Diffusion, Norm, PredefinedNoiseSchedule
     from ..trainer.metrics import average_over_batch_metrics, pretty_print
     from ..utils.dtype import resolve_float_dtype
     from ..utils.train_utils import Queue, get_grad_norm
 except ImportError:  # pragma: no cover
-    from dataset import RxnDataset
+    from dataset import ReactionPairDataset
     from denoising import ConfidencePredictor, Denoiser
     from diffusion import DiffSchedule, Diffusion, Norm, PredefinedNoiseSchedule
     from trainer.metrics import average_over_batch_metrics, pretty_print
@@ -35,12 +44,13 @@ LR_SCHEDULER = {
 }
 
 
-def _build_dataset(training_config: Dict, split: str) -> RxnDataset:
+def _build_dataset(training_config: Dict, split: str) -> ReactionPairDataset:
+    """Construct a split-specific ``ReactionPairDataset`` from training_config paths."""
     react_key = f"{split}_react_file"
     product_key = f"{split}_product_file"
     if react_key not in training_config or product_key not in training_config:
         raise KeyError(f"training_config must define `{react_key}` and `{product_key}`")
-    return RxnDataset(
+    return ReactionPairDataset(
         react_file=training_config[react_key],
         product_file=training_config[product_key],
         cutoff=training_config.get("cutoff", 6.0),
@@ -54,6 +64,7 @@ def _build_dataset(training_config: Dict, split: str) -> RxnDataset:
 
 
 def _default_conditions(batch: Dict, condition_nf: int) -> Optional[torch.Tensor]:
+    """Create zero graph-level conditions when a model expects condition columns."""
     if condition_nf <= 0:
         return None
     num_graphs = int(batch["mask"].max().item()) + 1
@@ -61,6 +72,7 @@ def _default_conditions(batch: Dict, condition_nf: int) -> Optional[torch.Tensor
 
 
 def _product_rmsd(batch: Dict, pred_pos: torch.Tensor, fragment_id: int = 1) -> np.ndarray:
+    """Compute per-sample RMSD on the product/final-state fragment."""
     rmsds = []
     batch_size = int(batch["mask"].max().item()) + 1
     for batch_idx in range(batch_size):
@@ -76,6 +88,8 @@ def _product_rmsd(batch: Dict, pred_pos: torch.Tensor, fragment_id: int = 1) -> 
 
 
 class DiffModule(LightningModule):
+    """LightningModule that trains the denoising diffusion model."""
+
     def __init__(
         self,
         model_config: Dict,
@@ -105,11 +119,13 @@ class DiffModule(LightningModule):
         fixed_idx=None,
     ) -> None:
         super().__init__()
-        del process_type
+        _ = process_type
         fragment_names = fragment_names or ["IS", "FS"]
         scales = [1.0] if scales is None else scales
         dtype = resolve_float_dtype(training_config.get("dtype", torch.float64))
 
+        # Build the neural noise predictor first. Diffusion will call this
+        # Denoiser at every training/sampling timestep.
         denoiser = Denoiser(
             model_config=model_config,
             node_nfs=node_nfs,
@@ -126,11 +142,13 @@ class DiffModule(LightningModule):
             dtype=dtype,
         )
 
+        # Norm owns the affine scaling for h=[pos, one_hot, charge].
         norm = Norm(
             norm_values=norm_values,
             norm_biases=norm_biases,
             pos_dim=pos_dim,
         )
+        # Training schedule controls alpha_t/sigma_t for forward diffusion.
         gamma_module = PredefinedNoiseSchedule(
             noise_schedule=noise_schedule,
             timesteps=timesteps,
@@ -151,12 +169,15 @@ class DiffModule(LightningModule):
         self.model_config = model_config
         self.optimizer_config = optimizer_config
         self.training_config = training_config
-        self.dtype = dtype
+        # LightningModule already owns a ``dtype`` property through nn.Module.
+        # Keep the dataset/model dtype under a project-specific name.
+        self.data_dtype = dtype
         self.loss_type = loss_type
         self.pos_only = pos_only
         self.condition_nf = condition_nf
         self.scales = scales
 
+        # Sampling can use fewer timesteps than training for faster evaluation.
         sampling_gamma_module = PredefinedNoiseSchedule(
             noise_schedule=noise_schedule,
             timesteps=training_config.get("sampling_timesteps", 150),
@@ -172,9 +193,12 @@ class DiffModule(LightningModule):
         if self.clip_grad:
             self.gradnorm_queue = Queue()
             self.gradnorm_queue.add(3000)
+        self._train_epoch_outputs = []
+        self._val_epoch_outputs = []
         self.save_hyperparameters(ignore=["model"])
 
     def configure_optimizers(self):
+        """Create optimizer and optional LR scheduler for Lightning."""
         optimizer = torch.optim.AdamW(self.ddpm.parameters(), **self.optimizer_config)
         schedule_type = self.training_config.get("lr_schedule_type")
         if schedule_type is not None:
@@ -186,6 +210,7 @@ class DiffModule(LightningModule):
         return optimizer
 
     def setup(self, stage: Optional[str] = None):
+        """Create datasets lazily when Lightning enters fit/test stages."""
         if stage in ("fit", None):
             self.train_dataset = _build_dataset(self.training_config, "train")
             self.val_dataset = _build_dataset(self.training_config, "val")
@@ -222,10 +247,13 @@ class DiffModule(LightningModule):
         )
 
     def compute_loss(self, batch):
+        """Run Diffusion.forward and combine returned terms into one loss."""
         conditions = _default_conditions(batch, self.condition_nf)
         loss_terms = self.ddpm.forward(batch, conditions)
         num_nodes = (batch["n_is"] + batch["n_fs"]).float()
 
+        # Normalize coordinate error by coordinate dimensionality and graph size
+        # so graphs with more atoms do not automatically dominate the loss.
         error_t_normalized = loss_terms["error_t"] / (self.ddpm.pos_dim * num_nodes)
         if self.loss_type == "l2" and self.training:
             loss_t = error_t_normalized
@@ -259,8 +287,11 @@ class DiffModule(LightningModule):
         jump_length: int = 1,
         frag_fixed=None,
     ):
+        """Run inpainting on a batch and report product-fragment RMSD."""
         del resamplings, jump_length
         frag_fixed = [0] if frag_fixed is None else frag_fixed
+        # Use a copy so evaluation can swap to a shorter sampling schedule
+        # without mutating the training object.
         sampling_ddpm = copy.deepcopy(self.ddpm)
         sampling_ddpm.schedule = self.sampling_schedule
         sampling_ddpm.T = self.sampling_schedule.gamma_module.timesteps
@@ -277,6 +308,7 @@ class DiffModule(LightningModule):
         return float(np.nanmean(rmsds)), float(np.nanmedian(rmsds))
 
     def training_step(self, batch, batch_idx):
+        """Lightning training step for one batch."""
         nll, info = self.compute_loss(batch)
         loss = nll.mean(0)
         self.log("train-totloss", loss, rank_zero_only=True)
@@ -289,9 +321,11 @@ class DiffModule(LightningModule):
         else:
             info["rmsd"], info["rmsd-median"] = np.nan, np.nan
         info["loss"] = loss
+        self._train_epoch_outputs.append(info)
         return info
 
     def _shared_eval(self, batch, batch_idx, prefix, *args):
+        """Shared validation/test step."""
         del args
         nll, info = self.compute_loss(batch)
         loss = nll.mean(0)
@@ -304,6 +338,8 @@ class DiffModule(LightningModule):
         info_prefix = {}
         for k, v in info.items():
             info_prefix[f"{prefix}-{k}"] = v
+        if prefix == "val":
+            self._val_epoch_outputs.append(info_prefix)
         return info_prefix
 
     def validation_step(self, batch, batch_idx, *args):
@@ -312,22 +348,36 @@ class DiffModule(LightningModule):
     def test_step(self, batch, batch_idx, *args):
         return self._shared_eval(batch, batch_idx, "test", *args)
 
-    def validation_epoch_end(self, val_step_outputs):
-        val_epoch_metrics = average_over_batch_metrics(val_step_outputs)
+    def on_train_epoch_start(self) -> None:
+        self._train_epoch_outputs = []
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_epoch_outputs = []
+
+    def on_validation_epoch_end(self) -> None:
+        val_epoch_metrics = average_over_batch_metrics(self._val_epoch_outputs)
         if self.trainer.is_global_zero:
             pretty_print(self.current_epoch, val_epoch_metrics, prefix="val")
         val_epoch_metrics.update({"epoch": self.current_epoch})
         for k, v in val_epoch_metrics.items():
             self.log(k, v, sync_dist=True)
 
-    def training_epoch_end(self, outputs) -> None:
-        epoch_metrics = average_over_batch_metrics(outputs, allowed=["rmsd", "rmsd-median"])
-        self.log("train-rmsd", epoch_metrics["rmsd"], sync_dist=True)
-        self.log("train-rmsd-median", epoch_metrics["rmsd-median"], sync_dist=True)
+    def on_train_epoch_end(self) -> None:
+        epoch_metrics = average_over_batch_metrics(
+            self._train_epoch_outputs,
+            allowed=["rmsd", "rmsd-median"],
+        )
+        self.log("train-rmsd", epoch_metrics.get("rmsd", np.nan), sync_dist=True)
+        self.log("train-rmsd-median", epoch_metrics.get("rmsd-median", np.nan), sync_dist=True)
 
     def configure_gradient_clipping(
-        self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm
+        self,
+        optimizer,
+        optimizer_idx=None,
+        gradient_clip_val=None,
+        gradient_clip_algorithm=None,
     ):
+        """Adaptive gradient clipping based on recent gradient norms."""
         del optimizer_idx, gradient_clip_val, gradient_clip_algorithm
         if not self.clip_grad:
             return
@@ -341,6 +391,8 @@ class DiffModule(LightningModule):
 
 
 class ConfModule(LightningModule):
+    """LightningModule for graph-level confidence prediction."""
+
     def __init__(
         self,
         model_config: Dict,
@@ -361,7 +413,7 @@ class ConfModule(LightningModule):
         target_key: str = "target",
     ) -> None:
         super().__init__()
-        del process_type, name_temp
+        _ = process_type, name_temp
         fragment_names = fragment_names or ["IS", "FS"]
         dtype = resolve_float_dtype(training_config.get("dtype", torch.float64))
         self.confidence = ConfidencePredictor(
@@ -379,7 +431,9 @@ class ConfModule(LightningModule):
         )
         self.optimizer_config = optimizer_config
         self.training_config = training_config
-        self.dtype = dtype
+        # LightningModule already owns a ``dtype`` property through nn.Module.
+        # Keep the dataset/model dtype under a project-specific name.
+        self.data_dtype = dtype
         self.condition_nf = condition_nf
         self.classification = classification
         self.target_key = target_key
@@ -387,6 +441,7 @@ class ConfModule(LightningModule):
         if self.clip_grad:
             self.gradnorm_queue = Queue()
             self.gradnorm_queue.add(3000)
+        self._val_epoch_outputs = []
         self.save_hyperparameters(ignore=["model"])
 
         if classification:
@@ -402,6 +457,7 @@ class ConfModule(LightningModule):
             self.SpearmanEval = SpearmanCorrCoef()
 
     def configure_optimizers(self):
+        """Create optimizer and optional LR scheduler for confidence model."""
         optimizer = torch.optim.AdamW(self.confidence.parameters(), **self.optimizer_config)
         schedule_type = self.training_config.get("lr_schedule_type")
         if schedule_type is not None:
@@ -413,6 +469,7 @@ class ConfModule(LightningModule):
         return optimizer
 
     def setup(self, stage: Optional[str] = None):
+        """Create split datasets for confidence training/evaluation."""
         if stage in ("fit", None):
             self.train_dataset = _build_dataset(self.training_config, "train")
             self.val_dataset = _build_dataset(self.training_config, "val")
@@ -449,6 +506,11 @@ class ConfModule(LightningModule):
         )
 
     def compute_loss(self, batch):
+        """Compute confidence prediction loss and metrics.
+
+        The default ``ReactionPairDataset`` does not include labels, so a real confidence
+        task must provide ``batch[target_key]`` through a labeled dataset wrapper.
+        """
         if self.target_key not in batch:
             raise KeyError(
                 f"Confidence training expects `{self.target_key}` in the batch. "
@@ -489,7 +551,10 @@ class ConfModule(LightningModule):
         del batch_idx, args
         loss, info = self.compute_loss(batch)
         info["totloss"] = loss.item()
-        return {f"{prefix}-{k}": v for k, v in info.items()}
+        info_prefix = {f"{prefix}-{k}": v for k, v in info.items()}
+        if prefix == "val":
+            self._val_epoch_outputs.append(info_prefix)
+        return info_prefix
 
     def validation_step(self, batch, batch_idx, *args):
         return self._shared_eval(batch, batch_idx, "val", *args)
@@ -497,8 +562,11 @@ class ConfModule(LightningModule):
     def test_step(self, batch, batch_idx, *args):
         return self._shared_eval(batch, batch_idx, "test", *args)
 
-    def validation_epoch_end(self, val_step_outputs):
-        val_epoch_metrics = average_over_batch_metrics(val_step_outputs)
+    def on_validation_epoch_start(self) -> None:
+        self._val_epoch_outputs = []
+
+    def on_validation_epoch_end(self) -> None:
+        val_epoch_metrics = average_over_batch_metrics(self._val_epoch_outputs)
         if self.trainer.is_global_zero:
             pretty_print(self.current_epoch, val_epoch_metrics, prefix="val")
         val_epoch_metrics.update({"epoch": self.current_epoch})

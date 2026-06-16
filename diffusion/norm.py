@@ -1,3 +1,4 @@
+"""Affine normalization for combined node states h=[pos, one_hot, charge]."""
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
@@ -9,6 +10,12 @@ FEATURE_MAPPING = ["pos", "one_hot", "charge"]
 
 
 class Norm(nn.Module):
+    """Normalize and unnormalize the combined node state ``h``.
+
+    ``h`` is always interpreted as ``[pos, one_hot, charge]``. The three groups
+    can use different scale/bias values while preserving the same tensor layout.
+    """
+
     def __init__(
         self,
         norm_values: Tuple = (1.0, 1.0, 1.0),
@@ -21,15 +28,18 @@ class Norm(nn.Module):
         self.pos_dim = pos_dim
 
     def split_h(self, h: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Split ``h`` into position, one-hot atom type, and charge columns."""
         pos = h[:, : self.pos_dim]
         charge = h[:, -1:]
         one_hot = h[:, self.pos_dim : -1]
         return pos, one_hot, charge
 
     def join_h(self, pos: Tensor, one_hot: Tensor, charge: Tensor) -> Tensor:
+        """Reassemble split feature groups into the canonical ``h`` layout."""
         return torch.cat([pos, one_hot, charge], dim=1)
 
     def normalize_batch(self, batch: Dict) -> Dict:
+        """Normalize ``batch['h']`` and keep ``batch['pos']`` synchronized."""
         out = dict(batch)
         h = batch["h"].clone()
         pos, one_hot, charge = self.split_h(h)
@@ -41,6 +51,7 @@ class Norm(nn.Module):
         return out
 
     def normalize_legacy(self, representations: List[Dict]) -> List[Dict]:
+        """Normalize older list-of-fragment representation objects."""
         for ii in range(len(representations)):
             for jj, feature_type in enumerate(FEATURE_MAPPING):
                 representations[ii][feature_type] = (
@@ -49,14 +60,17 @@ class Norm(nn.Module):
         return representations
 
     def normalize(self, inputs):
+        """Dispatch normalization for current dict batches or legacy inputs."""
         if isinstance(inputs, dict):
             return self.normalize_batch(inputs)
         return self.normalize_legacy(inputs)
 
     def unnormalize(self, x: Tensor, ind: int) -> Tensor:
+        """Invert one feature group's affine normalization."""
         return x * self.norm_values[ind] + self.norm_biases[ind]
 
     def unnormalize_h(self, h: Tensor) -> Tensor:
+        """Invert normalization for the canonical combined ``h`` tensor."""
         pos, one_hot, charge = self.split_h(h)
         pos = self.unnormalize(pos, 0)
         one_hot = self.unnormalize(one_hot, 1)
@@ -64,6 +78,7 @@ class Norm(nn.Module):
         return self.join_h(pos, one_hot, charge)
 
     def unnormalize_z(self, z_combined):
+        """Legacy-compatible unnormalization for tensors or fragment lists."""
         if isinstance(z_combined, Tensor):
             return self.unnormalize_h(z_combined)
         for ii in range(len(z_combined)):

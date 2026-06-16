@@ -1,0 +1,30 @@
+{
+  "run_name": "pdau_test",
+  "output_dir": "/Users/wx/Desktop/yyxwjq/akmcgc/tests/react_product_xyz_training/runs/pdau_test",
+  "split_dir": "/Users/wx/Desktop/yyxwjq/akmcgc/tests/react_product_xyz_training/splits/seed_42",
+  "seed": 42,
+  "model_type": "egnn",
+  "hidden_nf": 128,
+  "n_layers": 3,
+  "cutoff": 6.0,
+  "max_neigh": 100,
+  "batch_size": 50,
+  "num_workers": 0,
+  "dtype": "float64",
+  "lr": 0.0001,
+  "timesteps": 2000,
+  "sampling_timesteps": 500,
+  "pos_only": true,
+  "condition_nf": 0,
+  "primary_generation_mode": "inpaint",
+  "primary_task": "conditioned reactant->product generation with frag_fixed=[0]",
+  "split_paths": {
+    "train_react": "/Users/wx/Desktop/yyxwjq/akmcgc/tests/react_product_xyz_training/splits/seed_42/train_react.xyz",
+    "train_product": "/Users/wx/Desktop/yyxwjq/akmcgc/tests/react_product_xyz_training/splits/seed_42/train_product.xyz",
+    "val_react": "/Users/wx/Desktop/yyxwjq/akmcgc/tests/react_product_xyz_training/splits/seed_42/val_react.xyz",
+    "val_product": "/Users/wx/Desktop/yyxwjq/akmcgc/tests/react_product_xyz_training/splits/seed_42/val_product.xyz",
+    "test_react": "/Users/wx/Desktop/yyxwjq/akmcgc/tests/react_product_xyz_training/splits/seed_42/test_react.xyz",
+    "test_product": "/Users/wx/Desktop/yyxwjq/akmcgc/tests/react_product_xyz_training/splits/seed_42/test_product.xyz",
+    "indices": "/Users/wx/Desktop/yyxwjq/akmcgc/tests/react_product_xyz_training/splits/seed_42/split_indices.json"
+  }
+}

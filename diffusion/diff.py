@@ -1,3 +1,15 @@
+"""DDPM-style diffusion wrapper around a Denoiser.
+
+This module owns the diffusion process:
+
+* sample training timesteps;
+* add Gaussian noise to ``h = [pos, features]``;
+* call ``Denoiser`` to predict the sampled noise;
+* compute loss terms;
+* run reverse sampling/inpainting.
+
+The Denoiser owns neural prediction. Diffusion owns time/noise math.
+"""
 from __future__ import annotations
 
 from typing import Dict, List, Optional
@@ -17,7 +29,12 @@ except ImportError:  # pragma: no cover
 
 
 class Diffusion(nn.Module):
-    """Joint-graph E(n) diffusion over periodic reaction-pair graphs."""
+    """Joint-graph E(n) diffusion over periodic reaction-pair graphs.
+
+    ``mask`` is used for sample-level diffusion quantities: one timestep and one
+    noise strength per reaction sample. ``fragment`` is passed through to the
+    denoiser/model so PBC geometry can distinguish reactant/product cells.
+    """
 
     def __init__(
         self,
@@ -51,9 +68,11 @@ class Diffusion(nn.Module):
         self.norm_biases = normalizer.norm_biases
 
     def _num_graphs(self, mask: Tensor) -> int:
+        """Infer batch size from a node-level batch mask."""
         return int(mask.max().item()) + 1 if mask.numel() > 0 else 0
 
     def _node_counts(self, mask: Tensor) -> Tensor:
+        """Count nodes in each reaction sample for likelihood bookkeeping."""
         return torch.bincount(mask, minlength=self._num_graphs(mask))
 
     def forward(
@@ -62,6 +81,11 @@ class Diffusion(nn.Module):
         conditions: Optional[Tensor] = None,
         return_pred: bool = False,
     ) -> Dict:
+        """Training/evaluation forward pass for one noisy timestep.
+
+        The returned dictionary contains per-sample loss terms plus the true
+        sampled noise ``eps_xh`` and network prediction ``net_eps_xh`` for debug.
+        """
         batch = self.normalizer.normalize_batch(batch)
         h = batch["h"]
         mask = batch["mask"]
@@ -71,6 +95,8 @@ class Diffusion(nn.Module):
 
         delta_log_px = self.delta_log_px(n_nodes).to(dtype=h.dtype)
 
+        # Training may sample t=0 for the reconstruction term. Evaluation skips
+        # t=0 in this branch so the noise-prediction term is well-defined.
         lowest_t = 0 if self.training else 1
         t_int = torch.randint(
             lowest_t,
@@ -82,13 +108,16 @@ class Diffusion(nn.Module):
         t_is_zero = (t_int == 0).float().squeeze(1)
         t_is_not_zero = 1.0 - t_is_zero
 
+        # Normalize integer timesteps to [0, 1] before querying the schedule.
         s = s_int / self.T
         t = t_int / self.T
 
         gamma_s = self.schedule.inflate_batch_array(self.schedule.gamma_module(s), h)
         gamma_t = self.schedule.inflate_batch_array(self.schedule.gamma_module(t), h)
 
+        # Forward diffusion: sample true noise eps_xh and construct noisy state z_t.
         z_t, eps_xh = self.noised_representation(h, mask, gamma_t)
+        # Neural reverse model: predict the same noise from z_t, t, and graph data.
         net_eps_xh, _ = self.denoiser(
             h=z_t,
             edge_index=batch["edge_index"],
@@ -107,6 +136,8 @@ class Diffusion(nn.Module):
             return {"eps_xh": eps_xh, "net_eps_xh": net_eps_xh}
 
         if self.pos_only:
+            # In position-only mode, feature noise is ignored and only coordinate
+            # noise contributes to the training target.
             net_eps_xh = net_eps_xh.clone()
             net_eps_xh[:, self.pos_dim :] = 0.0
 
@@ -118,6 +149,7 @@ class Diffusion(nn.Module):
         coord_error = coord_error * t_is_not_zero
         feature_error = torch.zeros_like(coord_error)
 
+        # t=0 uses a reconstruction-style term in x-space.
         x_pred = self.compute_x_pred(net_eps_xh, z_t, gamma_t, mask)
         loss_0_x = utils.sum_except_batch(
             (x_pred[:, : self.pos_dim] - h[:, : self.pos_dim]) ** 2,
@@ -142,9 +174,11 @@ class Diffusion(nn.Module):
         }
 
     def delta_log_px(self, num_nodes: Tensor) -> Tensor:
+        """Log-scale correction for normalized coordinate variables."""
         return -self.subspace_dimensionality(num_nodes).float() * np.log(self.norm_values[0])
 
     def subspace_dimensionality(self, input_size: Tensor) -> Tensor:
+        """Coordinate degrees of freedom after removing one global translation."""
         return (input_size - 1) * self.pos_dim
 
     def noised_representation(
@@ -153,6 +187,7 @@ class Diffusion(nn.Module):
         mask: Tensor,
         gamma_t: Tensor,
     ) -> tuple[Tensor, Tensor]:
+        """Apply forward diffusion ``z_t = alpha_t h + sigma_t eps``."""
         alpha_t = self.schedule.alpha(gamma_t, h)
         sigma_t = self.schedule.sigma(gamma_t, h)
         eps_xh = self.sample_combined_position_feature_noise(h, mask)
@@ -160,6 +195,11 @@ class Diffusion(nn.Module):
         return z_t, eps_xh
 
     def sample_combined_position_feature_noise(self, h: Tensor, mask: Tensor) -> Tensor:
+        """Sample coordinate and feature noise with zero-COM coordinate noise.
+
+        Coordinate noise is independent per atom, then centered per ``mask`` so
+        the diffusion process does not learn arbitrary global translations.
+        """
         eps_x = utils.sample_center_gravity_zero_gaussian_batch(
             size=(h.size(0), self.pos_dim),
             indices=[mask],
@@ -183,6 +223,7 @@ class Diffusion(nn.Module):
         mask: Tensor,
         fix_noise: bool = False,
     ) -> Tensor:
+        """Sample ``mu + sigma * eps`` with the same noise convention as training."""
         del fix_noise
         eps_xh = self.sample_combined_position_feature_noise(mu, mask)
         return mu + sigma[mask] * eps_xh
@@ -194,6 +235,7 @@ class Diffusion(nn.Module):
         gamma_t: Tensor,
         mask: Tensor,
     ) -> Tensor:
+        """Recover predicted clean ``x`` from noisy ``z_t`` and predicted noise."""
         sigma_t = self.schedule.sigma(gamma_t, target_tensor=net_eps_xh)
         alpha_t = self.schedule.alpha(gamma_t, target_tensor=net_eps_xh)
         return (zt_xh - sigma_t[mask] * net_eps_xh) / alpha_t[mask]
@@ -207,6 +249,7 @@ class Diffusion(nn.Module):
         conditions: Optional[Tensor] = None,
         fix_noise: bool = False,
     ) -> Tensor:
+        """One reverse diffusion step: sample ``z_s`` from current ``z_t``."""
         gamma_s = self.schedule.gamma_module(s)
         gamma_t = self.schedule.gamma_module(t)
         sigma2_t_given_s, sigma_t_given_s, alpha_t_given_s = self.schedule.sigma_and_alpha_t_given_s(
@@ -215,6 +258,8 @@ class Diffusion(nn.Module):
         sigma_s = self.schedule.sigma(gamma_s, target_tensor=zt_xh)
         sigma_t = self.schedule.sigma(gamma_t, target_tensor=zt_xh)
 
+        # Predict current noise, then use the DDPM posterior coefficients to move
+        # one step toward a cleaner state.
         net_eps_xh, _ = self.denoiser(
             h=zt_xh,
             edge_index=batch["edge_index"],
@@ -237,6 +282,8 @@ class Diffusion(nn.Module):
         )[batch["mask"]]
         sigma = sigma_t_given_s * sigma_s / sigma_t
         zs_xh = self.sample_normal(mu, sigma, batch["mask"], fix_noise=fix_noise)
+        # Re-center coordinates after sampling to keep the translational degree
+        # of freedom removed throughout the reverse chain.
         zs_xh[:, : self.pos_dim] = utils.remove_mean_batch(
             zs_xh[:, : self.pos_dim], batch["mask"]
         )
@@ -249,6 +296,7 @@ class Diffusion(nn.Module):
         conditions: Optional[Tensor] = None,
         fix_noise: bool = False,
     ) -> Tensor:
+        """Final denoising step from ``z_0`` to generated ``x``."""
         n_graphs = self._num_graphs(batch["mask"])
         t_zeros = torch.zeros(size=(n_graphs, 1), device=z0_xh.device, dtype=z0_xh.dtype)
         gamma_0 = self.schedule.gamma_module(t_zeros)
@@ -285,15 +333,19 @@ class Diffusion(nn.Module):
         return_frames: int = 1,
         timesteps: Optional[int] = None,
     ) -> Dict:
+        """Generate a full joint graph by running the reverse diffusion chain."""
         del return_frames
         timesteps = self.T if timesteps is None else timesteps
         batch = self.normalizer.normalize_batch(batch)
         h0 = batch["h"].clone()
+        # Start from pure noise with the same shape as h. Graph topology, atom
+        # types, cell and PBC metadata still come from the input batch.
         zt_xh = self.sample_combined_position_feature_noise(h0, batch["mask"])
         if self.pos_only:
             zt_xh[:, self.pos_dim :] = h0[:, self.pos_dim :]
 
         for s in reversed(range(0, timesteps)):
+            # Reverse chain uses deterministic timestep order T, T-1, ..., 0.
             s_array = torch.full(
                 (self._num_graphs(batch["mask"]), 1),
                 fill_value=s,
@@ -332,6 +384,11 @@ class Diffusion(nn.Module):
         timesteps: Optional[int] = None,
         frag_fixed: Optional[List[int]] = None,
     ) -> Dict:
+        """Generate unknown fragments while keeping selected fragments fixed.
+
+        This is the reaction-prediction path: typically keep reactant
+        ``fragment == 0`` fixed and denoise/generate product ``fragment == 1``.
+        """
         del return_frames, resamplings, jump_length
         timesteps = self.T if timesteps is None else timesteps
         frag_fixed = [0] if frag_fixed is None else frag_fixed
@@ -342,6 +399,8 @@ class Diffusion(nn.Module):
         for idx in frag_fixed:
             fixed_mask |= batch["fragment"] == idx
 
+        # Unknown nodes start from noise. Known fragment values are re-inserted
+        # at every reverse step below.
         zt_xh = self.sample_combined_position_feature_noise(h_fixed, batch["mask"])
         if self.pos_only:
             zt_xh[:, self.pos_dim :] = h_fixed[:, self.pos_dim :]
@@ -366,6 +425,8 @@ class Diffusion(nn.Module):
             )
             gamma_s = self.schedule.inflate_batch_array(self.schedule.gamma_module(s_array), h_fixed)
             z_known, _ = self.noised_representation(h_fixed, batch["mask"], gamma_s)
+            # Repaint fixed fragments with their correctly noised known values so
+            # the generated fragment remains conditioned on the fixed structure.
             zs_xh[fixed_mask, : self.pos_dim] = z_known[fixed_mask, : self.pos_dim]
             zs_xh[fixed_mask, self.pos_dim :] = h_fixed[fixed_mask, self.pos_dim :]
             if self.pos_only:

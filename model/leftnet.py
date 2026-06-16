@@ -1,3 +1,15 @@
+"""LEFTNet equivariant backbone.
+
+LEFTNet is an alternative to EGNN with richer local frames and vector channels.
+For new readers, focus on ``LEFTNet.forward`` first:
+
+1. recover PBC distances/edge vectors;
+2. build edge-wise and node-wise local frames;
+3. run scalar/vector message passing layers;
+4. decode coordinate updates and scalar node features.
+
+The public forward signature matches EGNN so ``Denoiser`` can wrap either model.
+"""
 import math
 from math import pi
 from typing import Optional, Tuple, Callable, List
@@ -23,6 +35,7 @@ EPS = 1e-6
 
 
 def swish(x):
+    """Swish activation used by some original LEFTNet components."""
     return x * torch.sigmoid(x)
 
 
@@ -62,6 +75,7 @@ class RBFEmb(nn.Module):
         self.betas.data.copy_(betas)
 
     def forward(self, dist):
+        """Embed scalar edge distances into radial basis features."""
         dist = dist.unsqueeze(-1)
         rbounds = 0.5 * (torch.cos(dist * pi / self.rbound_upper) + 1.0)
         rbounds = rbounds * (dist < self.rbound_upper).float()
@@ -80,6 +94,7 @@ class NeighborEmb(MessagePassing):
         self.ln_emb = nn.LayerNorm(hid_dim, elementwise_affine=False)
 
     def forward(self, z, s, edge_index, embs):
+        """Aggregate neighbor atom embeddings into initial scalar features."""
         s_neighbors = self.ln_emb(self.embedding(z))
         s_neighbors = self.propagate(edge_index, x=s_neighbors, norm=embs)
 
@@ -103,17 +118,15 @@ class CFConvS2V(MessagePassing):
         )
 
     def forward(self, s, v, edge_index, emb):
-        """_summary_
+        """Convert scalar features to vector features through edge directions.
 
         Args:
-            s (_type_): _description_, [n_atom, n_z, n_embed]
-            v (_type_): _description_, [n_edge, n_pos, n_embed]
-            edge_index (_type_): _description_, [2, n_edge]
-            emb (_type_): _description_, [n_edge, n_embed]
-
-        Returns:
-            _type_: _description_
+            s: ``[N, hidden]`` scalar node features.
+            v: ``[E, 3, hidden]`` edge direction/vector features.
+            edge_index: ``[2, E]`` graph edges.
+            emb: ``[E, hidden]`` radial edge embedding.
         """
+        # Convert scalar node features into vector messages along edge directions.
         s = self.lin1(s)
         emb = emb.unsqueeze(1) * v
 
@@ -127,6 +140,8 @@ class CFConvS2V(MessagePassing):
 
 
 class GCLMessage(nn.Module):
+    """Scalar message-passing layer used inside LEFTNet."""
+
     def __init__(
         self,
         hidden_channels,
@@ -156,6 +171,7 @@ class GCLMessage(nn.Module):
         self.x_layernorm.reset_parameters()
 
     def forward(self, x, edge_index, weight):
+        """Update scalar node states and edge weights."""
         xh = self.x_layernorm(x)
         edgeh = weight
 
@@ -166,11 +182,13 @@ class GCLMessage(nn.Module):
         return xh, edgeh
 
     def edge_message(self, xh_i, xh_j, edgeh):
+        """Build one learned scalar message per edge."""
         m_ij = self.edge_mlp(torch.cat([xh_i, xh_j, edgeh], dim=1))
         m_ij = m_ij * self.att_mlp(m_ij)
         return m_ij
 
     def node_message(self, xh, edge_index, m_ij):
+        """Scatter edge messages back to source nodes."""
         ii, jj = edge_index
         agg = unsorted_segment_sum(
             m_ij,
@@ -185,6 +203,8 @@ class GCLMessage(nn.Module):
 
 
 class EquiMessage(MessagePassing):
+    """Equivariant scalar/vector message layer."""
+
     def __init__(
         self,
         hidden_channels,
@@ -291,6 +311,8 @@ class EquiMessage(MessagePassing):
 
 
 class EquiUpdate(nn.Module):
+    """Update scalar and vector channels using node-local frames."""
+
     def __init__(self, hidden_channels, reflect_equiv: bool = True):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -348,6 +370,8 @@ class EquiUpdate(nn.Module):
 
 
 class _EquiUpdate(nn.Module):
+    """Alternative equivariant update block retained for compatibility."""
+
     def __init__(self, hidden_channels, reflect_equiv: bool = True):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -420,6 +444,8 @@ class _EquiUpdate(nn.Module):
 
 
 class vector(MessagePassing):
+    """Construct node-wise vectors by aggregating edge direction information."""
+
     def __init__(self):
         super(vector, self).__init__(aggr="mean")
 
@@ -430,14 +456,15 @@ class vector(MessagePassing):
 
 
 def nn_vector(dist: Tensor, edge_index: Tensor, pos: Tensor):
-    r"""Added by Chenru: Getting the nearest neighbor position to construct nodeframe.
+    """Build a nearest-neighbor style vector basis for node frames.
 
     Args:
-        dist (Tensor): (n_edge)
-        edge_index (Tensor): (2, n_edge)
-        pos (Tensor): (n_atom, 3)
+        dist: ``[E]`` edge distances.
+        edge_index: ``[2, E]`` graph edges.
+        pos: ``[N, 3]`` coordinates.
+
     Returns:
-        Tensor: (n_atom, 3)
+        ``[N, 3]`` reference neighbor positions used to construct node frames.
     """
     ii, jj = edge_index
     vec = []
@@ -462,14 +489,7 @@ def nn_vector(dist: Tensor, edge_index: Tensor, pos: Tensor):
 
 
 def assert_rot_equiv(func: Callable, dist: Tensor, edge_index: Tensor, pos: Tensor):
-    r"""Added by Chenru: test a func for constructing y1 is equivariant.
-
-    Args:
-        func (Callable): _description_
-        dist (Tensor): _description_
-        edge_index (Tensor): _description_
-        pos (Tensor): _description_
-    """
+    """Debug helper that checks a vector-construction function is equivariant."""
     theta = 0.4
     alpha = 0.9
     rot_x = torch.tensor(
@@ -499,6 +519,8 @@ def assert_rot_equiv(func: Callable, dist: Tensor, edge_index: Tensor, pos: Tens
 
 
 class EquiOutput(nn.Module):
+    """Decode scalar/vector states into final scalar and vector outputs."""
+
     def __init__(self, hidden_channels, out_channels=1, single_layer_output=True):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -578,6 +600,8 @@ class GatedEquivariantBlock(nn.Module):
 
 
 class LEFTNet(torch.nn.Module):
+    """Local-frame equivariant network with the same external API as EGNN."""
+
     r"""
     LEFTNet
 
@@ -743,6 +767,12 @@ class LEFTNet(torch.nn.Module):
         fragment: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
     ):
+        """Run LEFTNet on a periodic joint graph.
+
+        Args follow the same contract as EGNN: ``h`` is scalar node input,
+        ``pos`` is ``[N, 3]``, ``edge_index`` is ``[2, E]``, and PBC tensors are
+        used to recover edge vectors for periodic systems.
+        """
         # if self.pos_require_grad:
         #     pos.requires_grad_()
 
@@ -751,10 +781,11 @@ class LEFTNet(torch.nn.Module):
 
         i, j = edge_index
 
-        # embed z, assuming last column is atom number
+        # Embed scalar node input into hidden channels.
         z_emb = self.embedding(h)
 
-        # Calculate distances with PBC if cell and pbc are provided
+        # Calculate distances with PBC if cell and pbc are provided. This keeps
+        # LEFTNet aligned with EGNN and the dataset's ASE cell_offsets.
         if cell is not None and pbc is not None:
             cell_offsets = cell_offsets if cell_offsets is not None else edge_shift
             out = get_pbc_distances(
@@ -773,6 +804,8 @@ class LEFTNet(torch.nn.Module):
         else:
             dist = (pos[i] - pos[j]).pow(2).sum(dim=-1).sqrt()
         
+        # Keep only edges inside the LEFTNet cutoff. subgraph_mask can further
+        # restrict edges for object-aware behavior.
         inner_subgraph_mask = torch.zeros(
             edge_index.size(1),
             1,
@@ -793,7 +826,7 @@ class LEFTNet(torch.nn.Module):
         pos_frame = pos.clone()
         pos_frame = remove_mean_batch(pos_frame, node_mask_w_cutoff.long())
 
-        # bulid edge-wise frame and scalarization vector features for edge update
+        # Build edge-wise frames and scalarized vector features for edge updates.
         # If we're using PBC, we need to calculate coord_diff using PBC-aware vectors
         if cell is not None and pbc is not None:
             out = get_pbc_distances(
@@ -835,6 +868,8 @@ class LEFTNet(torch.nn.Module):
         coord_cross = coord_cross * all_edge_masks
         coord_vertical = coord_vertical * all_edge_masks
 
+        # frame stores three local basis vectors per edge:
+        # direction, cross direction, and vertical direction.
         frame = torch.cat(
             (
                 coord_diff.unsqueeze(-1),
@@ -850,7 +885,7 @@ class LEFTNet(torch.nn.Module):
         rbounds = 0.5 * (torch.cos(dist * pi / self.cutoff) + 1.0)
         f = rbounds.unsqueeze(-1) * f
 
-        # init node features
+        # Initialize node features from neighboring atoms and radial embeddings.
         s = self.neighbor_emb(h, z_emb, edge_index, f)
 
         NE1 = self.s2v(s, coord_diff.unsqueeze(-1), edge_index, f)
@@ -873,7 +908,7 @@ class LEFTNet(torch.nn.Module):
         # add distance embedding
         edgeweight = torch.cat((edgeweight, radial_emb), dim=-1)
 
-        # bulid node-wise frame for node-update
+        # Build node-wise frames for scalar/vector channel updates.
         a = pos_frame
         if self.legacy:
             b = self.vec(pos_frame, edge_index)
@@ -901,7 +936,7 @@ class LEFTNet(torch.nn.Module):
         vec = torch.zeros(s.size(0), 3, s.size(1), dtype=s.dtype, device=s.device)
         gradient = torch.zeros(s.size(0), 3, dtype=pos.dtype, device=s.device)
         for i in range(self.num_layers):
-            # Added by Chenru: for letting multiple objects message passing.
+            # Scalar edge/node message passing.
             if self.legacy or i == 0:
                 s = s + self.pos_expansion(pos_prjt)
             s, edgeweight = self.gcl_layers[i](
@@ -910,6 +945,7 @@ class LEFTNet(torch.nn.Module):
                 edgeweight,
             )
 
+            # Equivariant message passing updates scalar and vector channels.
             dx, dvec = self.message_layers[i](
                 s,
                 vec,
@@ -924,6 +960,7 @@ class LEFTNet(torch.nn.Module):
             s = s * self.inv_sqrt_2
 
             if self.update:
+                # Node-wise frame update mixes scalar/vector features.
                 dx, dvec = self.update_layers[i](s, vec, nodeframe)
                 s = s + dx
                 vec = vec + dvec
@@ -944,6 +981,8 @@ class LEFTNet(torch.nn.Module):
 
         if update_coords_mask is not None:
             dpos = update_coords_mask * dpos
+        # Final coordinate update; dpos is equivariant because it is decoded from
+        # vector channels tied to local frames.
         pos = pos + dpos + gradient
 
         if self.ff:

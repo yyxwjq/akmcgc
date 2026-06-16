@@ -1,4 +1,4 @@
-"""Utility functions for model"""
+"""Utility functions shared by EGNN/LEFTNet message-passing layers."""
 import torch
 from torch import Tensor
 
@@ -11,6 +11,7 @@ except ImportError:  # pragma: no cover - support running from the repo root
 
 
 def coord2cross(x, edge_index, norm_constant=1):
+    """Return normalized cross products for optional reflection-sensitive terms."""
     row, col = edge_index
     cross = torch.cross(x[row], x[col], dim=1)
     norm = torch.linalg.norm(cross, dim=1, keepdim=True)
@@ -55,6 +56,8 @@ def coord2diff(
     row, col = edge_index
 
     if cell is not None and pbc is not None:
+        # Delegate PBC vector recovery to utils.graph so dataset and model use
+        # the same cell_offsets convention.
         if edge_shift is None:
             edge_shift = cell_offsets
         coord_diff, distances = get_edge_vectors_pbc(
@@ -72,6 +75,8 @@ def coord2diff(
         coord_diff = x[row] - x[col]
         radial = torch.sum((coord_diff) ** 2, 1).unsqueeze(1)
 
+    # Normalize the vector but keep the scalar squared distance separately for
+    # invariant edge features.
     norm = torch.sqrt(radial + 1e-8)
     coord_diff = coord_diff / (norm + norm_constant)
     return radial, coord_diff
@@ -86,6 +91,8 @@ def unsorted_segment_sum(
     result_shape = (num_segments, data.size(1))
     result = data.new_full(result_shape, 0)  # Init empty result tensor.
     segment_ids = segment_ids.unsqueeze(-1).expand(-1, data.size(1))
+    # For graph message passing, segment_ids is usually edge_index[0]. This
+    # scatters all edge messages back to their source/center node.
     result.scatter_add_(0, segment_ids, data)
     if aggregation_method == "sum":
         result = result / normalization_factor

@@ -32,7 +32,12 @@ def resolve_float_dtype(
     dtype: Optional[torch.dtype | str],
     default: torch.dtype = torch.float64,
 ) -> torch.dtype:
-    """Resolve a dtype config value to a floating-point ``torch.dtype``."""
+    """Resolve a config value to a floating-point ``torch.dtype``.
+
+    Accepts either actual torch dtype objects or common string aliases such as
+    ``"float64"`` and ``"torch.double"``. The project defaults to float64 for
+    stable periodic-geometry/equivariance debug.
+    """
     if dtype is None:
         return default
     if isinstance(dtype, torch.dtype):

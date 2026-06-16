@@ -1,4 +1,12 @@
-"""t schedule used in diffusion process."""
+"""Noise schedules and DDPM coefficients used by ``Diffusion``.
+
+The schedule maps a normalized timestep ``t in [0, 1]`` to ``gamma`` where:
+
+``alpha = sqrt(sigmoid(-gamma))``
+``sigma = sqrt(sigmoid(gamma))``
+
+Large sigma means noisy; large alpha means close to clean data.
+"""
 from typing import Tuple
 import numpy as np
 import torch
@@ -47,6 +55,8 @@ def clip_noise_schedule(alphas2, clip_value=0.001):
     This may help improve stability during
     sampling.
     """
+    # Clip the per-step alpha ratio rather than alpha itself. This avoids very
+    # abrupt changes between adjacent reverse-sampling steps.
     alphas2 = np.concatenate([np.ones(1), alphas2], axis=0)
 
     alphas_step = alphas2[1:] / alphas2[:-1]
@@ -89,6 +99,8 @@ class PredefinedNoiseSchedule(nn.Module):
         super().__init__()
         self.timesteps = timesteps
 
+        # Produce an array alpha_t^2 for t=0..T according to the selected
+        # schedule family.
         if "cosine" in noise_schedule:
             splits = noise_schedule.split("_")
             assert len(splits) <= 2
@@ -116,6 +128,8 @@ class PredefinedNoiseSchedule(nn.Module):
         log_alphas2 = np.log(alphas2)
         log_sigmas2 = np.log(sigmas2)
 
+        # gamma = log(sigma^2 / alpha^2). It is stored as a non-trainable
+        # parameter so it follows the module device/dtype mechanics.
         log_alphas2_to_sigmas2 = log_alphas2 - log_sigmas2
 
         # print("gamma", -log_alphas2_to_sigmas2)
@@ -125,6 +139,7 @@ class PredefinedNoiseSchedule(nn.Module):
         )
 
     def forward(self, t):
+        """Lookup gamma for normalized timestep tensor ``t``."""
         t_int = torch.round(t * self.timesteps).long()
         gamma = self.gamma[t_int].to(device=t.device)
         if t.is_floating_point():
@@ -133,6 +148,8 @@ class PredefinedNoiseSchedule(nn.Module):
 
 
 class DiffSchedule(nn.Module):
+    """Converts gamma values into alpha/sigma coefficients."""
+
     def __init__(self, gamma_module: nn.Module, norm_values: Tuple[float]) -> None:
         super().__init__()
         self.gamma_module = gamma_module
@@ -173,6 +190,8 @@ class DiffSchedule(nn.Module):
             alpha t given s = alpha t / alpha s,
             sigma t given s = sqrt(1 - (alpha t given s) ^2 ).
         """
+        # These coefficients parameterize q(z_s | z_t, x) during reverse
+        # sampling. Shapes are inflated to broadcast over [N, F] node tensors.
         sigma2_t_given_s = self.inflate_batch_array(
             -torch.expm1(F.softplus(gamma_s) - F.softplus(gamma_t)), target_tensor
         )
@@ -190,6 +209,7 @@ class DiffSchedule(nn.Module):
         return sigma2_t_given_s, sigma_t_given_s, alpha_t_given_s
 
     def check_issues_norm_values(self, num_stdevs=8):
+        """Guard against an overly large normalization value near t=0."""
         zeros = torch.zeros((1, 1))
         gamma_0 = self.gamma_module(zeros)
         sigma_0 = self.sigma(gamma_0, target_tensor=zeros).item()

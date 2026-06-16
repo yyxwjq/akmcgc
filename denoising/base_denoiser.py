@@ -1,4 +1,16 @@
-"""Base class for joint-graph denoising network wrappers."""
+"""Shared machinery for denoising network wrappers.
+
+``Denoiser`` is not the message-passing network itself. It wraps an equivariant
+model such as EGNN/LEFTNet with:
+
+1. a node feature encoder for ``h[:, pos_dim:]``;
+2. optional time/condition concatenation;
+3. a node feature decoder that maps hidden states back to predicted feature
+   noise.
+
+Coordinates stay in ``h[:, :pos_dim]`` and are passed directly to the equivariant
+model.
+"""
 from __future__ import annotations
 
 from typing import Dict, List, Optional
@@ -35,6 +47,8 @@ class BaseDenoiser(nn.Module):
         super().__init__()
         del enforce_same_encoding
 
+        # node_nfs can be a single integer for the current joint-graph path or a
+        # list for compatibility with older multi-fragment configs.
         if isinstance(node_nfs, int):
             node_nfs = [node_nfs]
         if len(node_nfs) == 0:
@@ -65,6 +79,8 @@ class BaseDenoiser(nn.Module):
 
         if model is None:
             model = EGNN
+        # The inner model sees encoded scalar features plus any conditioning
+        # columns. It predicts updated hidden features and updated coordinates.
         self.model = model(**model_config)
         self.model.to(dtype=self.dtype)
         if source is not None and "model" in source:
@@ -73,6 +89,9 @@ class BaseDenoiser(nn.Module):
         self.dist_dim = getattr(self.model, "dist_dim", 0)
         self.model_input_dim = int(model_config["in_node_nf"])
 
+        # ``model_input_dim`` is the actual input feature dimension expected by
+        # EGNN/LEFTNet. Reserve columns for time/global conditions; the remaining
+        # columns are produced by ``node_encoder``.
         self.embed_dim = self.model_input_dim
         if self.condition_time:
             self.embed_dim -= 1
@@ -85,6 +104,12 @@ class BaseDenoiser(nn.Module):
         self.to(dtype=self.dtype)
 
     def build_encoders_decoders(self, source: Optional[Dict] = None) -> None:
+        """Build feature encoders/decoders around the equivariant model.
+
+        ``feat_dim = node_nf - pos_dim`` because position is handled separately.
+        For the default data contract, ``node_nf=122`` and ``pos_dim=3``, so
+        scalar/node feature dimension is 119.
+        """
         feat_dim = self.node_nf - self.pos_dim
         self.node_encoder = MLP(
             in_dim=feat_dim,
@@ -111,6 +136,9 @@ class BaseDenoiser(nn.Module):
                 except RuntimeError:
                     pass
 
+        # Edge encoders are only used when explicit edge features are supplied.
+        # The current debug/training path usually uses edge_nf=0 and lets EGNN
+        # construct distance-based edge features internally.
         self.edge_embed_dim = int(self.model_config.get("in_edge_nf", 0))
         if self.edge_nf > 0 and self.edge_embed_dim > 0:
             self.edge_encoder = MLP(
@@ -130,9 +158,11 @@ class BaseDenoiser(nn.Module):
             self.edge_decoder = None
 
     def encode_node_features(self, h: torch.Tensor) -> torch.Tensor:
+        """Encode only non-coordinate node features from ``h``."""
         return self.node_encoder(h[:, self.pos_dim :].clone())
 
     def decode_node_features(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Decode hidden node states back to predicted feature noise."""
         return self.node_decoder(hidden)
 
     def augment_with_conditions(
@@ -142,6 +172,12 @@ class BaseDenoiser(nn.Module):
         mask: torch.Tensor,
         conditions: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, int]:
+        """Append sample-level time/global conditions to each node.
+
+        ``t`` and ``conditions`` are shaped by graph/sample, not by node. ``mask``
+        broadcasts them to nodes: all atoms from the same reaction sample receive
+        the same time condition.
+        """
         condition_dim = 0
         if self.condition_time:
             if t.dim() == 0:

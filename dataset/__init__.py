@@ -1,1 +1,2 @@
-from .rxn_dataset import RxnDataset, RPDataset, RP_Dataset
+"""Dataset public API."""
+from .reaction_pair_dataset import ReactionPairDataset

@@ -1,3 +1,4 @@
+"""Graph-level confidence predictor built from the denoising encoder stack."""
 from __future__ import annotations
 
 from typing import Dict, Optional
@@ -17,6 +18,13 @@ from .base_denoiser import BaseDenoiser
 
 
 class ConfidencePredictor(BaseDenoiser):
+    """Graph-level confidence head built on the same equivariant encoder stack.
+
+    Unlike ``Denoiser``, this module does not predict diffusion noise. It runs
+    the graph through EGNN/LEFTNet, mean-pools node features by ``mask``, and
+    predicts one scalar confidence per reaction sample.
+    """
+
     def __init__(
         self,
         model_config: Dict,
@@ -69,7 +77,10 @@ class ConfidencePredictor(BaseDenoiser):
         batch: Dict,
         conditions: Optional[Tensor] = None,
     ) -> Tensor:
+        """Return one confidence score per graph/sample in the batch."""
         h = batch["h"]
+        # Reuse the same feature encoder and time-conditioning pathway as the
+        # Denoiser. Confidence uses t=0 as a neutral fixed condition.
         pos = h[:, : self.pos_dim].clone()
         hidden = self.encode_node_features(h)
         hidden, _ = self.augment_with_conditions(
@@ -105,5 +116,6 @@ class ConfidencePredictor(BaseDenoiser):
         else:
             node_features = model_out
 
+        # Pool nodes into graph-level features before the final readout.
         graph_features = scatter_mean(node_features, index=batch["mask"], dim=0)
         return self.readout(graph_features).squeeze(-1)

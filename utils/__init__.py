@@ -1,3 +1,4 @@
+"""Shared utility functions for graph geometry, dtype, tensors, and training."""
 from .graph import (
     atoms_to_tensors,
     get_pbc_distances,

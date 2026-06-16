@@ -1,6 +1,4 @@
-"""
-Core layers provide basic operations, e.g., MLP
-"""
+"""Small neural-network building blocks used by model modules."""
 from typing import List, Union
 
 import torch
@@ -16,7 +14,7 @@ ACTIVATION_MAPPING = {
 
 
 class ZeroLayer(nn.Module):
-    r"""A skeleton layer that returns zeros."""
+    r"""A skeleton layer that returns zeros with the same shape as its first input."""
 
     def forward(self, inputs: List[Tensor], **kwargs) -> Tensor:
         del kwargs
@@ -26,7 +24,7 @@ class ZeroLayer(nn.Module):
 
 
 class ConcatLayer(nn.Module):
-    r"""Concatnate layer."""
+    r"""Concatenate a list of tensors along a configurable dimension."""
 
     def __init__(self, dim: int = -1) -> None:
         super().__init__()
@@ -38,7 +36,7 @@ class ConcatLayer(nn.Module):
 
 
 class OneLayerActivation(nn.Module):
-    r"""One layer NN with activation."""
+    r"""Linear layer followed by an activation or identity."""
 
     def __init__(
         self,
@@ -58,7 +56,7 @@ class OneLayerActivation(nn.Module):
 
 
 class MLP(nn.Module):
-    r"""Multi-layer perceptron."""
+    r"""Multi-layer perceptron built from ``OneLayerActivation`` blocks."""
 
     def __init__(
         self,
@@ -70,6 +68,8 @@ class MLP(nn.Module):
     ):
         super().__init__()
         input_dim = in_dim
+        # A single activation name applies to every layer. A list can be used
+        # when the caller needs different activations per layer.
         if isinstance(activation, str) or activation is None:
             activation = [activation] * len(out_dims)
         else:
@@ -78,6 +78,7 @@ class MLP(nn.Module):
                 out_dims
             ), "activation and out_dims must have the same length"
         if last_layer_no_activation:
+            # Common for prediction heads where the output should be unbounded.
             activation[-1] = None
         for _activation in activation:
             assert (_activation is None) or (
@@ -137,4 +138,5 @@ class GatedMLP(nn.Module):
         self.gate_activation = ACTIVATION_MAPPING[gate_activation]()
 
     def forward(self, input: Tensor) -> Tensor:
+        # One MLP predicts values; the second predicts a sigmoid gate.
         return self.mlp(input) * self.gate_activation(self.gmlp(input))

@@ -1,9 +1,11 @@
+"""Small metric formatting/aggregation helpers for training loops."""
 from typing import Dict, List
 import numpy as np
 import torch
 
 
 def average_over_batch_metrics(batch_metrics: List[Dict], allowed: List = []):
+    """Average a list of metric dictionaries, skipping NaN values."""
     epoch_metrics = {}
     effective_batch = {}
     for ii, out in enumerate(batch_metrics):
@@ -23,6 +25,7 @@ def average_over_batch_metrics(batch_metrics: List[Dict], allowed: List = []):
 
 
 def pretty_print(epoch, metric_dict, prefix="Train"):
+    """Print a compact metric line for quick local debugging."""
     out = f"{prefix} epoch {epoch} "
     for k, v in metric_dict.items():
         out += f"{k} {v:.2f} "

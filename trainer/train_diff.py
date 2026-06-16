@@ -1,3 +1,9 @@
+"""Example training entrypoint for the periodic joint-graph diffusion model.
+
+This script is intentionally concrete: it wires together a model config,
+dataset paths, optimizer config, Lightning callbacks, and ``DiffModule``. New
+users can copy it and replace the data paths/config values for real training.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,6 +26,8 @@ model_type = "leftnet"
 version = "joint-periodic-v1"
 project = "akmcgc"
 
+# Backbone-specific config. Denoiser wraps whichever model class is selected
+# below. ``in_node_nf`` / ``in_hidden_channels`` includes time conditioning.
 egnn_config = dict(
     in_node_nf=8,
     in_edge_nf=0,
@@ -72,6 +80,8 @@ repo_root = Path(__file__).resolve().parents[1]
 sample_react = repo_root / "tests" / "data" / "h2o_react.extxyz"
 sample_product = repo_root / "tests" / "data" / "h2o_product.extxyz"
 
+# Dataset/trainer config. The sample paths make this file runnable as a minimal
+# smoke test; real runs should point these fields to larger extxyz trajectories.
 training_config = dict(
     train_react_file=str(sample_react),
     train_product_file=str(sample_product),
@@ -118,6 +128,7 @@ precision = 1e-5
 run_name = f"{model_type}-{version}-" + str(uuid4()).split("-")[-1]
 
 seed_everything(42, workers=True)
+# DiffModule builds Denoiser + Diffusion + Lightning train/val/test hooks.
 diff_mod = DiffModule(
     model_config=model_config,
     optimizer_config=optimizer_config,

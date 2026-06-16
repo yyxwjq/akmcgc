@@ -1,12 +1,11 @@
-from __future__ import annotations
-
 """Placeholder confidence-training entrypoint for the joint periodic graph pipeline.
 
 This script is intentionally lightweight: confidence training now expects a
 joint-graph dataset that appends graph-level labels to the batch dict. The
-default `RxnDataset` does not provide those labels, so users should prepare a
+default `ReactionPairDataset` does not provide those labels, so users should prepare a
 task-specific labeled dataset before using `ConfModule`.
 """
+from __future__ import annotations
 
 from pathlib import Path
 from uuid import uuid4
@@ -28,6 +27,7 @@ model_type = "leftnet"
 version = "joint-periodic-confidence-v1"
 project = "akmcgc-confidence"
 
+# Backbone config for the graph encoder used by ConfidencePredictor.
 egnn_config = dict(
     in_node_nf=8,
     in_edge_nf=0,
@@ -79,6 +79,8 @@ repo_root = Path(__file__).resolve().parents[1]
 sample_react = repo_root / "tests" / "data" / "h2o_react.extxyz"
 sample_product = repo_root / "tests" / "data" / "h2o_product.extxyz"
 
+# These paths are placeholders for smoke tests. A real confidence dataset must
+# also add batch["target"] or another target_key expected by ConfModule.
 training_config = dict(
     train_react_file=str(sample_react),
     train_product_file=str(sample_product),
@@ -111,6 +113,7 @@ edge_cutoff = None
 run_name = f"{model_type}-{version}-" + str(uuid4()).split("-")[-1]
 
 seed_everything(42, workers=True)
+# ConfModule builds ConfidencePredictor + metrics/loss for Lightning.
 conf_mod = ConfModule(
     model_config=model_config,
     optimizer_config=optimizer_config,

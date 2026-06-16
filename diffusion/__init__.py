@@ -1,3 +1,4 @@
+"""Diffusion schedules, normalizers, and DDPM wrapper public API."""
 from . import diff_utils as utils
 from .diff_sched import DiffSchedule, PredefinedNoiseSchedule
 from .norm import Norm, GraphNorm, Normalizer

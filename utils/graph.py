@@ -1,8 +1,16 @@
-"""
-Copyright (c) Facebook, Inc. and its affiliates.
+"""Graph and periodic-geometry helpers used by dataset and models.
 
-This source code is licensed under the MIT license found in the
-LICENSE file in the root directory of this source tree.
+This module is the single source of truth for the package's PBC convention.
+ASE finds neighbors and returns integer lattice image offsets; the model later
+recovers Cartesian edge vectors from ``pos/cell/cell_offsets``.
+
+Important tensor contracts:
+
+``edge_index``: ``[2, E]`` directed edges, first row is the center/source node.
+``cell_offsets``: ``[E, 3]`` integer lattice shifts returned by ASE.
+``cell``: ``[2, 3, 3]`` for one joint graph or ``[B, 2, 3, 3]`` for a batch.
+``fragment``: node-level IS/FS id, used to choose reactant/product cell.
+``mask``: node-level batch id, used together with ``fragment`` for batched cells.
 """
 from typing import Dict, Optional, Tuple
 
@@ -28,6 +36,8 @@ def atoms_to_tensors(
     ``[pos, one_hot, charge]``.
     """
     dtype = resolve_float_dtype(dtype)
+    # Atomic number Z becomes one-hot index Z - 1. This keeps H at column 0,
+    # He at column 1, ..., Og at column 117 when num_elements=118.
     atomic_numbers = torch.as_tensor(
         atoms.get_atomic_numbers(),
         dtype=torch.long,
@@ -108,6 +118,7 @@ _CONFIG_EXCEPTIONS = {
 
 
 def _outer_shell_electrons_single(atomic_number: int) -> int:
+    """Compute outer-shell electron count from a simple Aufbau filling table."""
     if atomic_number <= 0 or atomic_number > 118:
         raise ValueError(f"Unsupported atomic number for outer-shell lookup: {atomic_number}")
 
@@ -115,6 +126,8 @@ def _outer_shell_electrons_single(atomic_number: int) -> int:
     if config is None:
         config = []
         remaining = atomic_number
+        # Fill orbitals in approximate Aufbau order, then count electrons on
+        # the largest principal quantum-number shell.
         for n, orbital, capacity in _ORBITAL_ORDER:
             if remaining <= 0:
                 break
@@ -146,6 +159,8 @@ def radius_graph_ase(
     if not use_pbc:
         atoms_for_graph.set_pbc(False)
 
+    # ASE performs the minimum-image neighbor search. ``S`` is the integer cell
+    # offset for the chosen periodic image of each destination atom.
     src, dst, cell_offsets, distance = neighbor_list(
         "ijSd",
         atoms_for_graph,
@@ -183,6 +198,8 @@ def _limit_neighbors(
     for atom_index in torch.unique(src, sorted=True):
         edge_ids = torch.where(src == atom_index)[0]
         if edge_ids.numel() > max_neigh:
+            # Limit each center atom independently so a dense periodic structure
+            # cannot dominate memory with very large outgoing neighborhoods.
             nearest = torch.argsort(distance[edge_ids])[:max_neigh]
             edge_ids = edge_ids[nearest]
         keep_parts.append(edge_ids)
@@ -205,7 +222,12 @@ def get_pbc_distances(
     return_distance_vec: bool = False,
     normalize: bool = False,
 ) -> Dict[str, torch.Tensor]:
-    """AdsorbDiff-style periodic distance recovery for strict periodic graphs."""
+    """Recover edge distances/vectors from a fixed periodic graph.
+
+    ASE already decided which periodic image belongs to every edge. This
+    function converts that integer image offset into a Cartesian offset and then
+    computes ``distance_vec_ij = pos_i - (pos_j + offset_ij)``.
+    """
     row, col = edge_index
     if cell.dim() == 4:
         if fragment is None or mask is None:
@@ -226,6 +248,8 @@ def get_pbc_distances(
             pbc=pbc,
             fragment=fragment,
         )
+    # ``offsets`` points from the original target atom to the periodic target
+    # image. Subtracting it gives source minus target-image.
     distance_vectors = pos[row] - pos[col] - offsets
     distances = distance_vectors.norm(dim=-1)
 
@@ -264,6 +288,9 @@ def get_edge_vectors_pbc(
     edge vector from `i` to the chosen image of `j`.
     """
     if edge_shift is None:
+        # Fallback minimum-image calculation for a single cell. The preferred
+        # path is to pass ASE cell_offsets so the dataset and model use exactly
+        # the same periodic images.
         row, col = edge_index
         edge_vectors = pos[row] - pos[col]
 
@@ -304,6 +331,7 @@ def get_pbc_offsets(
     pbc,
     fragment: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Convert lattice offsets to Cartesian offsets for one non-batched graph."""
     row, _ = edge_index
     shift = torch.as_tensor(cell_offsets, dtype=cell.dtype, device=cell.device)
     if cell.dim() == 4:
@@ -313,6 +341,8 @@ def get_pbc_offsets(
     if cell.dim() == 3:
         if fragment is None:
             raise ValueError("fragment is required when cell is stacked per fragment")
+        # One joint graph stores cells as [2, 3, 3], so fragment selects the
+        # reactant/product cell for each edge.
         edge_cell = cell[fragment[row]]
         edge_pbc = torch.as_tensor(pbc, dtype=torch.bool, device=cell.device)[fragment[row]]
         shift = torch.where(edge_pbc, shift, torch.zeros_like(shift))
@@ -334,6 +364,8 @@ def get_pbc_offsets_batched(
     """Return cartesian periodic offsets for batched joint graphs."""
     row, col = edge_index
     shift = torch.as_tensor(cell_offsets, dtype=cell.dtype, device=cell.device)
+    # Batched joint graph case: every edge needs both batch id and fragment id
+    # before it can select the correct cell/pbc slice.
     edge_batch = mask[row]
     edge_fragment = fragment[row]
     edge_cell = cell[edge_batch, edge_fragment]
@@ -426,6 +458,7 @@ def _apply_mic(
     cell: torch.Tensor,
     pbc: torch.Tensor,
 ) -> torch.Tensor:
+    """Apply a simple minimum-image convention to vectors for a single cell."""
     inv_cell = torch.linalg.inv(cell)
     frac_vectors = vectors @ inv_cell
     shifts = -torch.floor(frac_vectors + 0.5)

@@ -1,0 +1,73 @@
+condition_nf: 0
+condition_time: true
+edge_cutoff: null
+edge_nf: 0
+enforce_same_encoding: null
+eval_epochs: 5
+fixed_idx: null
+fragment_names:
+- IS
+- FS
+loss_type: l2
+model_config:
+  act_fn: swish
+  aggregation_method: mean
+  attention: false
+  coords_range: 5.0
+  edge_hidden_nf: 32
+  hidden_nf: 64
+  in_edge_nf: 0
+  in_node_nf: 65
+  inv_sublayers: 1
+  n_layers: 2
+  norm_constant: 1.0
+  normalization_factor: 1.0
+  out_node_nf: null
+  reflect_equiv: true
+  sin_embedding: false
+  tanh: true
+node_nfs:
+- 122
+noise_schedule: cosine
+norm_biases: !!python/tuple
+- 0.0
+- 0.0
+- 0.0
+norm_values: !!python/tuple
+- 1.0
+- 1.0
+- 1.0
+optimizer_config:
+  betas:
+  - 0.9
+  - 0.999
+  lr: 0.0001
+  weight_decay: 0.0
+pos_dim: 3
+pos_only: true
+precision: 1.0e-05
+process_type: null
+scales:
+- 1.0
+source: null
+timesteps: 1000
+training_config:
+  bz: 100
+  clip_grad: false
+  cutoff: 6.0
+  device: cpu
+  dtype: float64
+  lr_schedule_type: null
+  max_neigh: 100
+  num_elements: 118
+  num_workers: 0
+  r_fixed: true
+  r_pbc: true
+  sampling_timesteps: 100
+  test_product_file: /Users/wx/Desktop/yyxwjq/tests/react_product_xyz_training/splits/seed_42/test_product.xyz
+  test_react_file: /Users/wx/Desktop/yyxwjq/tests/react_product_xyz_training/splits/seed_42/test_react.xyz
+  train_product_file: /Users/wx/Desktop/yyxwjq/tests/react_product_xyz_training/splits/seed_42/train_product.xyz
+  train_react_file: /Users/wx/Desktop/yyxwjq/tests/react_product_xyz_training/splits/seed_42/train_react.xyz
+  val_product_file: /Users/wx/Desktop/yyxwjq/tests/react_product_xyz_training/splits/seed_42/val_product.xyz
+  val_react_file: /Users/wx/Desktop/yyxwjq/tests/react_product_xyz_training/splits/seed_42/val_react.xyz
+update_pocket_coords: true

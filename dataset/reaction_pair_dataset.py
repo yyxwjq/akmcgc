@@ -1,8 +1,18 @@
-"""
-Copyright (c) Facebook, Inc. and its affiliates.
+"""Dataset utilities for periodic reaction-pair joint graphs.
 
-This source code is licensed under the MIT license found in the
-LICENSE file in the root directory of this source tree.
+Read this file first when trying to understand how raw ``extxyz`` structures
+become the tensors used by EGNN/Denoiser/Diffusion. A single dataset item is a
+joint graph containing both the reactant/initial state and product/final state:
+
+```
+nodes = [reactant atoms, product atoms]
+fragment = 0 for reactant nodes, 1 for product nodes
+mask = batch id, filled during ``collate_fn``
+```
+
+The graph intentionally contains only intra-fragment edges. Reactant edges and
+product edges are generated separately, then concatenated into one disconnected
+joint graph.
 """
 from pathlib import Path
 from typing import Any, Dict, List
@@ -19,7 +29,7 @@ except ImportError:  # pragma: no cover - allows top-level local imports in note
     from utils.dtype import resolve_float_dtype
 
 
-class RxnDataset(Dataset):
+class ReactionPairDataset(Dataset):
     """Reaction-pair dataset that returns one joint graph per sample.
 
     Reactant/initial-state atoms and product/final-state atoms are concatenated
@@ -43,6 +53,18 @@ class RxnDataset(Dataset):
         return_distances: bool = False,
         dtype: torch.dtype | str = torch.float64,
     ) -> None:
+        """Store file paths and eagerly read all matching reaction frames.
+
+        Args:
+            react_file: Reactant/initial-state trajectory file.
+            product_file: Product/final-state trajectory file with same frame count.
+            cutoff: Neighbor cutoff passed to ASE neighbor list.
+            max_neigh: Maximum outgoing neighbors per atom after distance sorting.
+            r_pbc: Whether to keep periodic boundary conditions while building edges.
+            return_distances: Debug option. Training normally recomputes distances
+                from ``pos/cell/cell_offsets`` instead of storing static values.
+            dtype: Floating dtype for ``h/pos/cell/cell_offsets``.
+        """
         self.react_file = Path(react_file)
         self.product_file = Path(product_file)
         self.cutoff = cutoff
@@ -74,7 +96,19 @@ class RxnDataset(Dataset):
         return self.n_frames
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Get one reaction pair as a joint reactant+product graph."""
+        """Get one reaction pair as a joint reactant+product graph.
+
+        Returns a dictionary with the contract used throughout the model:
+
+        ``h``: ``[N, 122]`` node state, ordered as ``[pos, one_hot, charge]``.
+        ``pos``: ``[N, 3]`` coordinates, duplicated from ``h[:, :3]``.
+        ``edge_index``: ``[2, E]`` sparse directed edges.
+        ``cell_offsets``: ``[E, 3]`` periodic image offsets from ASE.
+        ``fragment``: ``[N]`` reactant/product id inside this reaction sample.
+        ``mask``: ``[N]`` batch id. For one sample it is all zero.
+        ``cell``: ``[2, 3, 3]`` reactant/product cells.
+        ``pbc``: ``[2, 3]`` reactant/product PBC flags.
+        """
         react_atoms = self.react_traj[idx].copy()
         product_atoms = self.product_traj[idx].copy()
 
@@ -115,9 +149,13 @@ class RxnDataset(Dataset):
             device=self.device,
             dtype=self.dtype,
         )
+        # Product node ids start after all reactant nodes, so product edges need
+        # an offset before both edge sets can live in the same joint graph.
         edge_index = torch.cat([edge_is, edge_fs + n_is], dim=1)
         cell_offsets = torch.cat([cell_offsets_is, cell_offsets_fs], dim=0)
 
+        # fragment is local reaction identity, not batch identity:
+        # 0 = initial/reactant, 1 = final/product.
         fragment = torch.cat(
             [
                 torch.zeros(n_is, dtype=torch.long, device=self.device),
@@ -133,6 +171,8 @@ class RxnDataset(Dataset):
             "cell_offsets": cell_offsets,
             "neighbors": torch.tensor([edge_index.size(1)], dtype=torch.long, device=self.device),
             "fragment": fragment,
+            # A single item is one graph, so mask is all zeros. collate_fn will
+            # rewrite this field to 0, 1, 2, ... for a real batch.
             "mask": torch.zeros(n_total, dtype=torch.long, device=self.device),
             "cell": torch.stack([cell_is, cell_fs], dim=0),
             "pbc": torch.stack([pbc_is, pbc_fs], dim=0),
@@ -140,6 +180,8 @@ class RxnDataset(Dataset):
             "n_fs": n_fs,
         }
         if self.return_distances:
+            # Optional debug path: store edge vectors/distances produced from the
+            # same PBC convention used by the model.
             pbc_geometry = get_pbc_distances(
                 pos=sample["pos"],
                 edge_index=edge_index,
@@ -155,7 +197,21 @@ class RxnDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Collate joint reaction graphs into one disconnected batch graph."""
+        """Collate joint reaction graphs into one disconnected batch graph.
+
+        Each dataset item is already a reaction-level joint graph:
+        reactant nodes and product nodes are concatenated, but only
+        intra-fragment edges are present. Collation adds a second, purely
+        computational concatenation: all reaction graphs in the mini-batch are
+        packed into one disconnected graph so the GNN can process the whole
+        mini-batch in a single tensorized forward pass. No cross-sample edges
+        are created here.
+
+        ``edge_index`` is shifted by the cumulative atom count. ``fragment``
+        stays local to each reaction sample, while ``mask`` records which batch
+        item every node came from. Batched cells become ``[B, 2, 3, 3]`` so PBC
+        code can select ``cell[mask[row], fragment[row]]`` per edge.
+        """
         if len(batch) == 0:
             raise ValueError("Cannot collate an empty batch")
 
@@ -166,7 +222,12 @@ class RxnDataset(Dataset):
         cell_offsets_list = []
         offset = 0
         for sample in batch:
+            # Every sample is built with local node ids starting at zero. After
+            # concatenating node tensors, later samples must point to their new
+            # global node ids in the big disconnected batch graph.
             edge_index_list.append(sample["edge_index"] + offset)
+            # PBC cell offsets are lattice-image shifts, not node ids, so they
+            # are concatenated unchanged.
             cell_offsets_list.append(sample["cell_offsets"])
             offset += sample["n_is"] + sample["n_fs"]
 
@@ -210,7 +271,3 @@ class RxnDataset(Dataset):
             out["edge_vec"] = torch.cat([sample["edge_vec"] for sample in batch], dim=0)
             out["edge_dist"] = torch.cat([sample["edge_dist"] for sample in batch], dim=0)
         return out
-
-
-RPDataset = RxnDataset
-RP_Dataset = RxnDataset

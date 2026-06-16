@@ -1,12 +1,20 @@
+"""Empirical node-count distributions for sampling utilities.
+
+These helpers are kept for compatibility with diffusion code that samples graph
+sizes from histograms. The current reaction debug path mostly uses fixed input
+graphs, but these classes explain how size priors would be represented.
+"""
 import torch
 from torch.distributions.categorical import Categorical
 
 import numpy as np
 
 
-# TODO: This code is just copied over diffSBDD and has not been modified at all...
 class DoubleDistributionNodes:
+    """Joint categorical distribution over two node-count variables."""
+
     def __init__(self, histogram):
+        # Histogram[i, j] is the empirical frequency for n1=i, n2=j.
         histogram = torch.tensor(histogram).float()
         histogram = histogram + 1e-3  # for numerical stability
 
@@ -37,11 +45,13 @@ class DoubleDistributionNodes:
         print("Entropy of n_nodes: H[N]", entropy.item())
 
     def sample(self, n_samples=1):
+        """Sample paired node counts from the joint distribution."""
         idx = self.m.sample((n_samples,))
         num_nodes_lig, num_nodes_pocket = self.idx_to_n_nodes[idx].T
         return num_nodes_lig, num_nodes_pocket
 
     def sample_conditional(self, n1=None, n2=None):
+        """Sample one count conditioned on the other count."""
         assert (n1 is None) ^ (n2 is None), "Exactly one input argument must be None"
 
         m = self.n1_given_n2 if n2 is not None else self.n2_given_n1
@@ -50,6 +60,7 @@ class DoubleDistributionNodes:
         return torch.tensor([m[i].sample() for i in c], device=c.device)
 
     def log_prob(self, batch_n_nodes_1, batch_n_nodes_2):
+        """Return log probability for paired node-count observations."""
         assert len(batch_n_nodes_1.size()) == 1
         assert len(batch_n_nodes_2.size()) == 1
 
@@ -83,6 +94,8 @@ class DoubleDistributionNodes:
 
 
 class SingleDistributionNodes:
+    """Categorical distribution over one node-count variable."""
+
     def __init__(self, histogram):
         self.n_nodes = []
         prob = []
@@ -103,10 +116,12 @@ class SingleDistributionNodes:
         self.m = Categorical(torch.tensor(prob))
 
     def sample(self, n_samples=1):
+        """Sample node counts from the empirical distribution."""
         idx = self.m.sample((n_samples,))
         return self.n_nodes[idx]
 
     def log_prob(self, batch_n_nodes):
+        """Return log probability for observed node counts."""
         assert len(batch_n_nodes.size()) == 1
 
         idcs = [self.keys[i.item()] for i in batch_n_nodes]

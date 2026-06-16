@@ -1,3 +1,4 @@
+"""Small tensor utilities for diffusion losses and noise sampling."""
 from typing import List
 
 import math
@@ -12,6 +13,7 @@ except ImportError:  # pragma: no cover - support running from the repo root
 
 
 def assert_mean_zero_with_mask(x, node_mask, eps=1e-10):
+    """Assert that each mask group has approximately zero summed coordinates."""
     largest_value = x.abs().max().item()
     error = scatter_add(x, node_mask, dim=0).abs().max().item()
     rel_error = error / (largest_value + eps)
@@ -21,6 +23,7 @@ def assert_mean_zero_with_mask(x, node_mask, eps=1e-10):
 def sample_center_gravity_zero_gaussian_batch(
     size: List[int], indices: List[Tensor]
 ) -> Tensor:
+    """Sample Gaussian coordinate noise and remove per-sample center of mass."""
     assert len(size) == 2
     x = torch.randn(size, device=indices[0].device)
 
@@ -31,19 +34,23 @@ def sample_center_gravity_zero_gaussian_batch(
 
 
 def sum_except_batch(x, indices, dim_size):
+    """Sum feature dimensions, then scatter sums by batch/sample index."""
     return scatter_add(x.sum(-1), indices, dim=0, dim_size=dim_size)
 
 
 def cdf_standard_gaussian(x):
+    """Standard normal CDF used by legacy likelihood code paths."""
     return 0.5 * (1.0 + torch.erf(x / math.sqrt(2)))
 
 
 def sample_gaussian(size, device):
+    """Plain standard Gaussian sampler."""
     x = torch.randn(size, device=device)
     return x
 
 
 def num_nodes_to_batch_mask(n_samples, num_nodes, device):
+    """Build a node-level batch mask from per-sample node counts."""
     assert isinstance(num_nodes, int) or len(num_nodes) == n_samples
 
     if isinstance(num_nodes, torch.Tensor):
