@@ -1,0 +1,9 @@
+{
+  "config_path": "/home/jqwang/work/genai/akmcgc/tests/react_product_xyz_training/runs/pdau_test/run_config.json",
+  "checkpoint_path": "/home/jqwang/work/genai/akmcgc/tests/react_product_xyz_training/runs/pdau_test/checkpoints/last.ckpt",
+  "output_dir": "/home/jqwang/work/genai/akmcgc/tests/react_product_xyz_training/runs/pdau_test/notebook_inpaint",
+  "sample_index": 0,
+  "seed": 123,
+  "timesteps": 100,
+  "product_rmsd": 13286.175494323343
+}

@@ -1,6 +1,6 @@
 {
-  "source_react": "/Users/wx/Desktop/yyxwjq/akmcgc/tests/data/react.xyz",
-  "source_product": "/Users/wx/Desktop/yyxwjq/akmcgc/tests/data/product.xyz",
+  "source_react": "/home/jqwang/work/genai/akmcgc/tests/data/react.xyz",
+  "source_product": "/home/jqwang/work/genai/akmcgc/tests/data/product.xyz",
   "seed": 42,
   "shuffle": true,
   "n_frames": 1430,
