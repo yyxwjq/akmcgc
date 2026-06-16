@@ -4,7 +4,7 @@ __pycache__/
 
 # Jupyter generated files
 .ipynb_checkpoints/
-
+tests/
 # Local conversation logs and PPT/debug notes
 conversation_history_*.md
 _conversation_history_*.md
